@@ -1,0 +1,136 @@
+menu "Core2 for AWS UI Test Harness"
+
+    config UITEST_ENABLED
+        bool "Enable LVGL UI test harness (synthetic touch over UART)"
+        default n
+        depends on !SCREENSHOT_SERIAL_TRIGGER
+        help
+            Registers a synthetic LVGL pointer input device and a serial
+            command listener. A host test runner can drive the on-device
+            UI by sending line-based commands (TAP/SWIPE/CLICK/...) over
+            UART, exactly as if a finger were touching the screen.
+
+            Pair with the screenshot component for Playwright-style
+            automated visual QA.
+
+    config UITEST_COMMAND_LINE_LENGTH
+        int "Maximum command line length"
+        default 160
+        range 64 512
+        depends on UITEST_ENABLED
+        help
+            Includes the terminating null byte. Longer lines are drained and
+            rejected as one command so the UART protocol remains synchronized.
+
+    config UITEST_CMD_PREFIX
+        string "Response line prefix"
+        default "UITEST"
+        depends on UITEST_ENABLED
+        help
+            Token prefixed to every reply the harness prints, e.g.
+            'UITEST: OK'. Used by the host runner to parse responses.
+
+    config UITEST_READ_PERIOD_MS
+        int "Assumed indev read period (ms)"
+        default 30
+        range 10 100
+        depends on UITEST_ENABLED
+        help
+            Approximate interval at which LVGL polls the synthetic input
+            device. Used to convert gesture durations into a number of
+            injected samples. The harness applies this period to its synthetic
+            LVGL input timer during initialization.
+
+    config UITEST_SAMPLE_QUEUE_DEPTH
+        int "Injected sample queue depth"
+        default 256
+        range 8 1024
+        depends on UITEST_ENABLED
+        help
+            Maximum samples in one pending gesture sequence. A complete
+            gesture is reserved before any samples are queued, preventing
+            partial or interleaved input when the queue is busy.
+
+    config UITEST_MAX_GESTURE_MS
+        int "Maximum gesture duration (ms)"
+        default 5000
+        range 100 30000
+        depends on UITEST_ENABLED
+        help
+            Upper bound accepted for LONGPRESS and SWIPE commands.
+
+    config UITEST_DRAIN_TIMEOUT_MS
+        int "Gesture drain timeout (ms)"
+        default 8000
+        range 500 60000
+        depends on UITEST_ENABLED
+        help
+            Maximum time a command waits for LVGL to consume all injected
+            samples before reporting a timeout.
+
+    config UITEST_SETTLE_MS
+        int "Post-gesture settle time (ms)"
+        default 100
+        range 0 2000
+        depends on UITEST_ENABLED
+        help
+            Additional delay after the final release is consumed before an OK
+            response is sent to the host.
+
+    config UITEST_LVGL_LOCK_TIMEOUT_MS
+        int "LVGL lock timeout (ms)"
+        default 1000
+        range 100 10000
+        depends on UITEST_ENABLED
+
+    config UITEST_SHOT_TIMEOUT_MS
+        int "SHOT completion timeout (ms)"
+        default 60000
+        range 1000 600000
+        depends on UITEST_ENABLED && SCREENSHOT_ASYNC
+        help
+            Maximum time SHOT waits for the screenshot worker before replying
+            ERR SHOT ESP_ERR_TIMEOUT and canceling queued captures. Keep it
+            below the host runner's SHOT timeout (120 s).
+
+    config UITEST_MAX_REGISTERED
+        int "Max registered widget IDs"
+        default 32
+        range 4 128
+        depends on UITEST_ENABLED
+        help
+            Size of the id->object table used by CLICK <id> and DUMP.
+
+    config UITEST_MAX_ID_LENGTH
+        int "Maximum widget ID length"
+        default 64
+        range 16 128
+        depends on UITEST_ENABLED
+        help
+            Includes the terminating null byte. IDs are copied into the
+            registry and may not contain whitespace.
+
+    config UITEST_MAX_DUMP_NODES
+        int "Maximum nodes in one DUMP"
+        default 256
+        range 16 1024
+        depends on UITEST_ENABLED
+        help
+            Bounds temporary heap use and UART output when serializing the
+            active LVGL object tree.
+
+    config UITEST_MAX_DUMP_DEPTH
+        int "Maximum DUMP tree depth"
+        default 32
+        range 4 128
+        depends on UITEST_ENABLED
+
+    config UITEST_TASK_STACK_SIZE
+        int "Command listener task stack size (bytes)"
+        default 8192
+        range 4096 32768
+        depends on UITEST_ENABLED
+        help
+            Stack size for the serial command listener task.
+
+endmenu
