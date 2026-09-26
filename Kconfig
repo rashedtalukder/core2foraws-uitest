@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Rashed Talukder
+# SPDX-License-Identifier: Apache-2.0
+
 menu "Core2 for AWS UI Test Harness"
 
     config UITEST_ENABLED
