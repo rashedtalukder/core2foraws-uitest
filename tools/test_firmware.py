@@ -11,7 +11,7 @@ import unittest
 @unittest.skipUnless(shutil.which("cc"), "native C compiler required")
 class FirmwareRegistryTests(unittest.TestCase):
     def test_cancel_waits_for_pointer_reset(self):
-        source = (Path(__file__).resolve().parents[1] / "uitest_indev.h").read_text()
+        source = (Path(__file__).resolve().parents[1] / "uitest_indev.c").read_text()
         implementation = source[source.index("esp_err_t uitest_cancel(void)\n{"):source.index("esp_err_t uitest_tap(")]
         program = r"""
 #include <assert.h>
@@ -64,12 +64,12 @@ int main(void) {
 
     def test_registry_rename_and_argument_boundaries(self):
         root = Path(__file__).resolve().parents[1]
-        registry_source = (root / "uitest_registry.h").read_text()
+        registry_source = (root / "uitest_registry.c").read_text()
         registry = registry_source[
             registry_source.index("esp_err_t uitest_register("):
             registry_source.index("static lv_obj_t *registry_find_locked")
         ]
-        source = (root / "uitest.c").read_text()
+        source = (root / "uitest_cmd.c").read_text()
         parser = source[source.index("static const char *skip_word"):source.index("static bool parse_id_arg")]
         program = r"""
 #define _POSIX_C_SOURCE 200809L

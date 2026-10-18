@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16)
 set(CORE2FORAWS_UITEST_VERSION "1.0.0")
 
 idf_component_register(
-    SRCS "uitest.c"
+    SRCS "uitest.c" "uitest_indev.c" "uitest_registry.c" "uitest_cmd.c"
     INCLUDE_DIRS "include"
     REQUIRES "lvgl" "esp_lvgl_port" "core2foraws-screenshot"
 )

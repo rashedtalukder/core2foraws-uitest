@@ -2,44 +2,25 @@
  * SPDX-FileCopyrightText: 2022 Rashed Talukder
  * SPDX-License-Identifier: MIT
  *
- * Internal synthetic LVGL pointer input device and gesture sample queue.
+ * Synthetic LVGL pointer input device and gesture sample queue.
  */
 
-#pragma once
+#include "uitest_priv.h"
 
-#include <stdatomic.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#ifdef CONFIG_UITEST_ENABLED
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
-
-#include "esp_err.h"
-#include "lvgl.h"
 #include "esp_lvgl_port.h"
 
-#define READ_PERIOD CONFIG_UITEST_READ_PERIOD_MS
+lv_indev_t          *s_indev;
+QueueHandle_t        s_sample_q;
+SemaphoreHandle_t    s_inject_lock;
+_Atomic TaskHandle_t s_listener_task;
+int16_t              s_last_x;
+int16_t              s_last_y;
+atomic_bool          s_release_pending;
+atomic_bool          s_ready;
 
-/* One injected pointer sample consumed per LVGL indev read. */
-typedef struct {
-    int16_t x;
-    int16_t y;
-    uint8_t pressed;    /* 1 = LV_INDEV_STATE_PRESSED, 0 = RELEASED */
-} inject_sample_t;
-
-static lv_indev_t        *s_indev;
-static QueueHandle_t      s_sample_q;
-static SemaphoreHandle_t  s_inject_lock;
-static _Atomic TaskHandle_t s_listener_task;
-static int16_t            s_last_x;
-static int16_t            s_last_y;
-static atomic_bool        s_release_pending;
-static atomic_bool        s_ready;
-
-static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
     inject_sample_t s;
@@ -175,7 +156,7 @@ esp_err_t uitest_cancel(void)
     return ESP_OK;
 }
 
-static esp_err_t wait_drained(void)
+esp_err_t wait_drained(void)
 {
     ulTaskNotifyTake(pdTRUE, 0);
     while (s_sample_q != NULL &&
@@ -255,3 +236,5 @@ esp_err_t uitest_swipe(int16_t x0, int16_t y0,
     finish_samples();
     return err;
 }
+
+#endif /* CONFIG_UITEST_ENABLED */
