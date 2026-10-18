@@ -98,7 +98,7 @@ menu "Core2 for AWS UI Test Harness"
 
     config UITEST_MAX_REGISTERED
         int "Max registered widget IDs"
-        default 32
+        default 64
         range 4 128
         depends on UITEST_ENABLED
         help

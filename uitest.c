@@ -38,353 +38,48 @@
 static const char *TAG = "UITEST";
 
 #define RESP_PREFIX  CONFIG_UITEST_CMD_PREFIX
-#define READ_PERIOD  CONFIG_UITEST_READ_PERIOD_MS
 
-/* ── Synthetic input device ─────────────────────────────────────── */
-
-/* One injected pointer sample consumed per LVGL indev read. */
-typedef struct {
-    int16_t x;
-    int16_t y;
-    uint8_t pressed;    /* 1 = LV_INDEV_STATE_PRESSED, 0 = RELEASED */
-} inject_sample_t;
-
-static lv_indev_t   *s_indev;
-static QueueHandle_t s_sample_q;
-static SemaphoreHandle_t s_inject_lock;
-static TaskHandle_t  s_listener_task;
-static int16_t       s_last_x;
-static int16_t       s_last_y;
-static atomic_bool s_release_pending;
 static atomic_flag s_init_busy = ATOMIC_FLAG_INIT;
-static atomic_bool s_ready;
 static atomic_bool s_stopping;
 static atomic_bool s_listener_running;
 
-static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
-{
-    (void)indev;
-    inject_sample_t s;
-
-    if (atomic_exchange(&s_release_pending, false)) {
-        lv_indev_reset(indev, NULL);
-        data->point.x = s_last_x;
-        data->point.y = s_last_y;
-        data->state = LV_INDEV_STATE_RELEASED;
-        if (s_listener_task != NULL) xTaskNotifyGive(s_listener_task);
-        return;
-    }
-
-    if (s_sample_q != NULL &&
-        xQueueReceive(s_sample_q, &s, 0) == pdTRUE) {
-        s_last_x = s.x;
-        s_last_y = s.y;
-        data->point.x = s.x;
-        data->point.y = s.y;
-        data->state = s.pressed ? LV_INDEV_STATE_PRESSED
-                                : LV_INDEV_STATE_RELEASED;
-        if (uxQueueMessagesWaiting(s_sample_q) == 0 && s_listener_task != NULL) {
-            xTaskNotifyGive(s_listener_task);
-        }
-    } else {
-        /* Idle: hold last position, report released. */
-        data->point.x = s_last_x;
-        data->point.y = s_last_y;
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
-    /* Leave continue_reading false so one sample is consumed per read
-     * period — this spreads a gesture over wall-clock time, which is what
-     * LVGL's scroll/gesture velocity detection expects. */
-}
-
-/* ── Bounds ─────────────────────────────────────────────────────── */
-
-static esp_err_t get_display_size(int32_t *width, int32_t *height)
-{
-    if (width == NULL || height == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!lvgl_port_lock(CONFIG_UITEST_LVGL_LOCK_TIMEOUT_MS)) {
-        return ESP_ERR_TIMEOUT;
-    }
-    lv_display_t *display = lv_display_get_default();
-    if (display == NULL) {
-        lvgl_port_unlock();
-        return ESP_ERR_INVALID_STATE;
-    }
-    *width = lv_display_get_horizontal_resolution(display);
-    *height = lv_display_get_vertical_resolution(display);
-    lvgl_port_unlock();
-    return ESP_OK;
-}
-
-static esp_err_t validate_point(int16_t x, int16_t y)
-{
-    int32_t width;
-    int32_t height;
-    esp_err_t err = get_display_size(&width, &height);
-    if (err != ESP_OK) {
-        return err;
-    }
-    return x >= 0 && y >= 0 && x < width && y < height
-        ? ESP_OK
-        : ESP_ERR_INVALID_ARG;
-}
-
-static esp_err_t validate_two_points(int16_t x0, int16_t y0,
-                                     int16_t x1, int16_t y1)
-{
-    int32_t width;
-    int32_t height;
-    esp_err_t err = get_display_size(&width, &height);
-    if (err != ESP_OK) return err;
-    bool valid = x0 >= 0 && y0 >= 0 && x0 < width && y0 < height &&
-                 x1 >= 0 && y1 >= 0 && x1 < width && y1 < height;
-    return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
-}
-
-static esp_err_t reserve_samples(size_t sample_count)
-{
-    if (!atomic_load(&s_ready)) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (sample_count == 0 || sample_count > CONFIG_UITEST_SAMPLE_QUEUE_DEPTH) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (xSemaphoreTake(s_inject_lock,
-                       pdMS_TO_TICKS(CONFIG_UITEST_DRAIN_TIMEOUT_MS)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    TickType_t started = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(CONFIG_UITEST_DRAIN_TIMEOUT_MS);
-    while (uxQueueSpacesAvailable(s_sample_q) < sample_count) {
-        if ((xTaskGetTickCount() - started) >= timeout) {
-            xSemaphoreGive(s_inject_lock);
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(1);
-    }
-    return ESP_OK;
-}
-
-static esp_err_t enqueue_reserved(int16_t x, int16_t y, bool pressed)
-{
-    inject_sample_t sample = {
-        .x = x,
-        .y = y,
-        .pressed = pressed ? 1 : 0,
-    };
-    return xQueueSend(s_sample_q, &sample, 0) == pdTRUE
-        ? ESP_OK
-        : ESP_FAIL;
-}
-
-static void finish_samples(void)
-{
-    xSemaphoreGive(s_inject_lock);
-}
-
-esp_err_t uitest_cancel(void)
-{
-    if (!atomic_load(&s_ready)) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_inject_lock, pdMS_TO_TICKS(CONFIG_UITEST_DRAIN_TIMEOUT_MS)) != pdTRUE)
-        return ESP_ERR_TIMEOUT;
-    xQueueReset(s_sample_q);
-    atomic_store(&s_release_pending, true);
-    xSemaphoreGive(s_inject_lock);
-    return ESP_OK;
-}
-
-static esp_err_t wait_drained(void)
-{
-    ulTaskNotifyTake(pdTRUE, 0);
-        while (s_sample_q != NULL &&
-            (uxQueueMessagesWaiting(s_sample_q) > 0 || atomic_load(&s_release_pending))) {
-        if (ulTaskNotifyTake(pdTRUE,
-                pdMS_TO_TICKS(CONFIG_UITEST_DRAIN_TIMEOUT_MS)) == 0) {
-            uitest_cancel();
-            return ESP_ERR_TIMEOUT;
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(READ_PERIOD + CONFIG_UITEST_SETTLE_MS));
-    return ESP_OK;
-}
-
-/* ── Public injection API ───────────────────────────────────────── */
-
-esp_err_t uitest_tap(int16_t x, int16_t y)
-{
-    esp_err_t err = validate_point(x, y);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = reserve_samples(2);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = enqueue_reserved(x, y, true);
-    if (err == ESP_OK) err = enqueue_reserved(x, y, false);
-    finish_samples();
-    return err;
-}
-
-esp_err_t uitest_long_press(int16_t x, int16_t y, uint32_t hold_ms)
-{
-    esp_err_t err = validate_point(x, y);
-    if (err != ESP_OK || hold_ms == 0 || hold_ms > CONFIG_UITEST_MAX_GESTURE_MS) {
-        return err != ESP_OK ? err : ESP_ERR_INVALID_ARG;
-    }
-    uint32_t steps = (hold_ms + READ_PERIOD - 1) / READ_PERIOD;
-    err = reserve_samples((size_t)steps + 1);
-    if (err != ESP_OK) {
-        return err;
-    }
-    for (uint32_t i = 0; i < steps; i++) {
-        err = enqueue_reserved(x, y, true);
-        if (err != ESP_OK) break;
-    }
-    if (err == ESP_OK) err = enqueue_reserved(x, y, false);
-    finish_samples();
-    return err;
-}
-
-esp_err_t uitest_swipe(int16_t x0, int16_t y0,
-                       int16_t x1, int16_t y1,
-                       uint32_t duration_ms)
-{
-    esp_err_t err = validate_two_points(x0, y0, x1, y1);
-    if (err != ESP_OK || duration_ms == 0 ||
-        duration_ms > CONFIG_UITEST_MAX_GESTURE_MS) {
-        return err != ESP_OK ? err : ESP_ERR_INVALID_ARG;
-    }
-    uint32_t intervals = (duration_ms + READ_PERIOD - 1) / READ_PERIOD;
-    if (intervals < 2) {
-        intervals = 2;
-    }
-    err = reserve_samples((size_t)intervals + 2);
-    if (err != ESP_OK) {
-        return err;
-    }
-    for (uint32_t i = 0; i <= intervals; i++) {
-        int32_t x = x0 + (int32_t)(x1 - x0) * (int32_t)i / (int32_t)intervals;
-        int32_t y = y0 + (int32_t)(y1 - y0) * (int32_t)i / (int32_t)intervals;
-        err = enqueue_reserved((int16_t)x, (int16_t)y, true);
-        if (err != ESP_OK) break;
-    }
-    if (err == ESP_OK) err = enqueue_reserved(x1, y1, false);
-    finish_samples();
-    return err;
-}
-
-/* ── Widget id registry ─────────────────────────────────────────── */
-
-typedef struct {
-    lv_obj_t *obj;
-    char id[CONFIG_UITEST_MAX_ID_LENGTH];
-} id_entry_t;
-
-static id_entry_t s_registry[CONFIG_UITEST_MAX_REGISTERED];
-
-static void registry_delete_cb(lv_event_t *event)
-{
-    lv_obj_t *deleted = lv_event_get_target(event);
-    for (int i = 0; i < CONFIG_UITEST_MAX_REGISTERED; i++) {
-        if (s_registry[i].obj == deleted) {
-            s_registry[i].obj = NULL;
-            s_registry[i].id[0] = '\0';
-        }
-    }
-}
-
-esp_err_t uitest_register(lv_obj_t *obj, const char *id)
-{
-    if (obj == NULL || id == NULL || id[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    size_t id_length = strnlen(id, CONFIG_UITEST_MAX_ID_LENGTH);
-    if (id_length >= CONFIG_UITEST_MAX_ID_LENGTH) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    for (size_t i = 0; i < id_length; i++) {
-        if (isspace((unsigned char)id[i])) {
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
-    if (!lvgl_port_lock(CONFIG_UITEST_LVGL_LOCK_TIMEOUT_MS)) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    int available = -1;
-    int existing = -1;
-    for (int i = 0; i < CONFIG_UITEST_MAX_REGISTERED; i++) {
-        if (s_registry[i].obj == obj) {
-            existing = i;
-        }
-        if (s_registry[i].obj != NULL && s_registry[i].obj != obj && strcmp(s_registry[i].id, id) == 0) {
-            lvgl_port_unlock();
-            return ESP_ERR_INVALID_STATE;
-        }
-        if (available < 0 && s_registry[i].obj == NULL) {
-            available = i;
-        }
-    }
-    if (existing >= 0) {
-        memcpy(s_registry[existing].id, id, id_length + 1);
-        lvgl_port_unlock();
-        return ESP_OK;
-    }
-    if (available < 0) {
-        lvgl_port_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (lv_obj_add_event_cb(obj, registry_delete_cb, LV_EVENT_DELETE, NULL) == NULL) {
-        lvgl_port_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-    s_registry[available].obj = obj;
-    memcpy(s_registry[available].id, id, id_length + 1);
-    lvgl_port_unlock();
-    return ESP_OK;
-}
-
-static lv_obj_t *registry_find_locked(const char *id)
-{
-    for (int i = 0; i < CONFIG_UITEST_MAX_REGISTERED; i++) {
-        if (s_registry[i].obj != NULL && s_registry[i].id[0] != '\0' &&
-            strcmp(s_registry[i].id, id) == 0) {
-            return s_registry[i].obj;
-        }
-    }
-    return NULL;
-}
+#include "uitest_indev.h"
+#include "uitest_registry.h"
 
 /* ── Command handling ───────────────────────────────────────────── */
 
-static void reply_ok(const char *fmt, ...)
+static void reply_ok_v(const char *fmt, va_list ap)
 {
     flockfile(stdout);
     printf("%s: OK ", RESP_PREFIX);
-    va_list ap;
-    va_start(ap, fmt);
     vprintf(fmt, ap);
-    va_end(ap);
     printf("\n");
     fflush(stdout);
     funlockfile(stdout);
 }
 
+static void reply_ok(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    reply_ok_v(fmt, ap);
+    va_end(ap);
+}
+
 static void reply_err(const char *msg)
 {
+    flockfile(stdout);
     printf("%s: ERR %s\n", RESP_PREFIX, msg);
     fflush(stdout);
+    funlockfile(stdout);
 }
 
 static void reply_command_error(const char *command, esp_err_t err)
 {
+    flockfile(stdout);
     printf("%s: ERR %s %s\n", RESP_PREFIX, command, esp_err_to_name(err));
     fflush(stdout);
+    funlockfile(stdout);
 }
 
 static void cmd_info(void)
@@ -407,102 +102,18 @@ static void cmd_info(void)
              (int)rot, READ_PERIOD);
 }
 
-typedef struct {
-    lv_obj_t *obj;
-    uint16_t depth;
-} dump_pending_t;
-
-typedef struct {
-    int32_t x;
-    int32_t y;
-    int32_t width;
-    int32_t height;
-    uint16_t depth;
-    bool clickable;
-    bool hidden;
-    char id[CONFIG_UITEST_MAX_ID_LENGTH];
-} dump_node_t;
-
-static void registry_id_copy_locked(lv_obj_t *obj, char *id)
-{
-    strcpy(id, "-");
-    for (int i = 0; i < CONFIG_UITEST_MAX_REGISTERED; i++) {
-        if (s_registry[i].obj == obj && s_registry[i].id[0] != '\0') {
-            strcpy(id, s_registry[i].id);
-            return;
-        }
-    }
-}
-
-static esp_err_t dump_snapshot(dump_node_t *nodes, size_t *node_count,
-                               bool *truncated)
-{
-    dump_pending_t *pending = calloc(CONFIG_UITEST_MAX_DUMP_NODES,
-                                     sizeof(dump_pending_t));
-    if (pending == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    if (!lvgl_port_lock(CONFIG_UITEST_LVGL_LOCK_TIMEOUT_MS)) {
-        free(pending);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    lv_obj_t *screen = lv_screen_active();
-    size_t count = 0;
-    size_t pending_count = 0;
-    *truncated = false;
-    if (screen != NULL) {
-        pending[pending_count++] = (dump_pending_t) { .obj = screen, .depth = 0 };
-    }
-
-    while (pending_count > 0 && count < CONFIG_UITEST_MAX_DUMP_NODES) {
-        dump_pending_t current = pending[--pending_count];
-        lv_area_t area;
-        lv_obj_get_coords(current.obj, &area);
-
-        dump_node_t *node = &nodes[count++];
-        node->x = area.x1;
-        node->y = area.y1;
-        node->width = area.x2 - area.x1 + 1;
-        node->height = area.y2 - area.y1 + 1;
-        node->depth = current.depth;
-        node->clickable = lv_obj_has_flag(current.obj, LV_OBJ_FLAG_CLICKABLE);
-        node->hidden = !lv_obj_is_visible(current.obj);
-        registry_id_copy_locked(current.obj, node->id);
-
-        uint32_t children = lv_obj_get_child_count(current.obj);
-        if (current.depth >= CONFIG_UITEST_MAX_DUMP_DEPTH) {
-            if (children > 0) *truncated = true;
-            continue;
-        }
-        for (uint32_t i = children; i > 0; i--) {
-            if (pending_count >= CONFIG_UITEST_MAX_DUMP_NODES) {
-                *truncated = true;
-                break;
-            }
-            pending[pending_count++] = (dump_pending_t) {
-                .obj = lv_obj_get_child(current.obj, i - 1),
-                .depth = (uint16_t)(current.depth + 1),
-            };
-        }
-    }
-    if (pending_count > 0) *truncated = true;
-    lvgl_port_unlock();
-    free(pending);
-    *node_count = count;
-    return ESP_OK;
-}
-
 static void cmd_dump(void)
 {
     dump_node_t *nodes = calloc(CONFIG_UITEST_MAX_DUMP_NODES,
                                 sizeof(dump_node_t));
     if (nodes == NULL) {
+        flockfile(stdout);
         printf("---%s_DUMP_START---\n", RESP_PREFIX);
         printf("%s: ERR DUMP %s\n", RESP_PREFIX,
                esp_err_to_name(ESP_ERR_NO_MEM));
         printf("---%s_DUMP_END---\n", RESP_PREFIX);
         fflush(stdout);
+        funlockfile(stdout);
         return;
     }
     size_t node_count = 0;
@@ -548,14 +159,6 @@ static void cmd_dump(void)
     fflush(stdout);
     funlockfile(stdout);
     free(nodes);
-}
-
-static bool widget_enabled(lv_obj_t *obj)
-{
-    for (lv_obj_t *ancestor = obj; ancestor != NULL; ancestor = lv_obj_get_parent(ancestor)) {
-        if (lv_obj_has_state(ancestor, LV_STATE_DISABLED)) return false;
-    }
-    return true;
 }
 
 static void cmd_get(const char *id)
@@ -624,7 +227,7 @@ static esp_err_t click_id(const char *id)
     if (obj != NULL) lv_obj_update_layout(obj);
     bool actionable = obj != NULL && lv_obj_is_visible(obj) &&
         widget_enabled(obj) &&
-        lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) &&
+        lv_obj_is_clickable(obj) &&
         lv_obj_get_screen(obj) == lv_screen_active();
     if (actionable) {
         lv_obj_get_coords(obj, &a);
@@ -724,15 +327,10 @@ static void finish_gesture_command(const char *command, esp_err_t err,
         return;
     }
 
-    flockfile(stdout);
-    printf("%s: OK ", RESP_PREFIX);
     va_list args;
     va_start(args, reply_format);
-    vprintf(reply_format, args);
+    reply_ok_v(reply_format, args);
     va_end(args);
-    printf("\n");
-    fflush(stdout);
-    funlockfile(stdout);
 }
 
 
@@ -939,9 +537,11 @@ static void handle_line(char *line)
 #endif
 
     } else {
+        flockfile(stdout);
         printf("%s: ERR %s unknown command or invalid arguments\n",
                RESP_PREFIX, verb);
         fflush(stdout);
+        funlockfile(stdout);
     }
 }
 
@@ -965,6 +565,7 @@ static void listener_task(void *arg)
     size_t length = 0;
     bool overflow = false;
 
+    atomic_store(&s_listener_task, xTaskGetCurrentTaskHandle());
     ESP_LOGI(TAG, "UI test harness ready — commands: "
                   "INFO DUMP TAP LONGPRESS SWIPE CLICK GET CANCEL SHOT");
 
@@ -988,11 +589,15 @@ static void listener_task(void *arg)
                     if (errno != 0 || request == 0 || !isdigit((unsigned char)line[1]) || *end != ' ') {
                         reply_err("invalid request id");
                     } else {
+                        flockfile(stdout);
                         printf("%s: BEGIN %lu\n", RESP_PREFIX, request);
                         fflush(stdout);
+                        funlockfile(stdout);
                         handle_line(end + 1);
+                        flockfile(stdout);
                         printf("%s: END %lu\n", RESP_PREFIX, request);
                         fflush(stdout);
+                        funlockfile(stdout);
                     }
                 } else {
                     handle_line(line);
@@ -1009,10 +614,7 @@ static void listener_task(void *arg)
         }
     }
 
-    /* indev_read_cb dereferences this handle under the LVGL lock. */
-    lvgl_port_lock(0);
-    s_listener_task = NULL;
-    lvgl_port_unlock();
+    atomic_store(&s_listener_task, NULL);
     atomic_store(&s_listener_running, false);
     vTaskDelete(NULL);
 }
@@ -1025,7 +627,7 @@ static esp_err_t init_impl(void)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_listener_task != NULL) return ESP_OK;
+    if (atomic_load(&s_listener_running)) return ESP_OK;
     if (atomic_load(&s_stopping)) return ESP_ERR_INVALID_STATE;
 
     /* The queue and mutex outlive deinit so late API callers never touch freed handles. */
@@ -1080,15 +682,17 @@ static esp_err_t init_impl(void)
 
     atomic_store(&s_ready, true);
     atomic_store(&s_listener_running, true);
+    TaskHandle_t listener = NULL;
     BaseType_t ok = xTaskCreatePinnedToCore(
         listener_task, "uitest", CONFIG_UITEST_TASK_STACK_SIZE,
-        NULL, 2, &s_listener_task, 0);
+        NULL, 2, &listener, 0);
     if (ok != pdPASS) {
         atomic_store(&s_listener_running, false);
         atomic_store(&s_ready, false);
         ESP_LOGE(TAG, "Failed to start listener task");
         return ESP_ERR_NO_MEM;
     }
+    atomic_store(&s_listener_task, listener);
 
     ESP_LOGI(TAG, "UI test harness initialized");
     return ESP_OK;
@@ -1104,7 +708,8 @@ esp_err_t uitest_init(void)
 
 esp_err_t uitest_deinit(void)
 {
-    if (s_listener_task != NULL && xTaskGetCurrentTaskHandle() == s_listener_task) {
+    TaskHandle_t listener = atomic_load(&s_listener_task);
+    if (listener != NULL && xTaskGetCurrentTaskHandle() == listener) {
         return ESP_ERR_INVALID_STATE;
     }
     if (atomic_flag_test_and_set(&s_init_busy)) return ESP_ERR_INVALID_STATE;

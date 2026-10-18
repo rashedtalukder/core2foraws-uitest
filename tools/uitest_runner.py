@@ -24,6 +24,7 @@ Firmware requirements:
 """
 
 import argparse
+import functools
 import importlib.util
 import json
 import re
@@ -37,7 +38,7 @@ from pathlib import Path
 try:
     import serial  # pyserial
 except ImportError:
-    sys.exit("pyserial is required: pip install -r requirements.txt")
+    serial = None
 
 PREFIX = "UITEST"
 # Matches CONFIG_ESP_CONSOLE_UART_BAUDRATE in the factory firmware.
@@ -49,6 +50,7 @@ OPEN_RESET_DETECT_TIMEOUT = 0.5
 OPEN_RESET_READY_TIMEOUT = 10.0
 
 
+@functools.lru_cache(maxsize=1)
 def screenshot_module():
     path = Path(__file__).resolve().parents[2] / "core2foraws-screenshot/tools/screenshot_capture.py"
     spec = importlib.util.spec_from_file_location("screenshot_capture", path)
@@ -71,11 +73,16 @@ class CaptureStream:
 
     def read_until(self, delimiter, size=None):
         client = self.client
-        if not client._rx_buffer:
-            client._rx_buffer = client.ser.read(min(256, size or 256))
+        if delimiter not in client._rx_buffer and (size is None or len(client._rx_buffer) < size):
+            in_waiting = getattr(client.ser, "in_waiting", 0) or 0
+            read_size = max(256, in_waiting)
+            if size is not None:
+                read_size = min(read_size, max(1, size - len(client._rx_buffer)))
+            client._rx_buffer += client.ser.read(read_size)
         end = client._rx_buffer.find(delimiter)
         count = end + len(delimiter) if end >= 0 else len(client._rx_buffer)
-        count = min(count, size or count)
+        if size is not None:
+            count = min(count, size)
         result, client._rx_buffer = client._rx_buffer[:count], client._rx_buffer[count:]
         return result
 
@@ -83,6 +90,8 @@ class CaptureStream:
 class UITestClient:
     def __init__(self, port, baud=DEFAULT_BAUD, prefix=PREFIX, verbose=False,
                  timeout=DEFAULT_REPLY_TIMEOUT, screenshot_marker="SCREENSHOT"):
+        if serial is None:
+            sys.exit("pyserial is required: pip install -r requirements.txt")
         self.prefix = prefix
         self.verbose = verbose
         self.timeout = timeout

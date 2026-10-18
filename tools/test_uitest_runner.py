@@ -258,6 +258,15 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual((result["text"], result["value"]), ("Ho", 3))
 
+    def test_capture_stream_reads_when_partial_buffer_lacks_delimiter(self):
+        serial = ScriptedSerial()
+        serial.pending.extend(b"ld\nrest")
+        client = make_client(serial)
+        client._rx_buffer = b"hello wor"
+        stream = uitest_runner.CaptureStream(client)
+        self.assertEqual(stream.read_until(b"\n"), b"hello world\n")
+        self.assertEqual(serial.pending, bytearray(b"rest"))
+
 
 if __name__ == "__main__":
     unittest.main()

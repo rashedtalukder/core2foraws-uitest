@@ -49,7 +49,7 @@ In `menuconfig` → *Core2 for AWS UI Test Harness*:
 | `UITEST_SETTLE_MS` | `100` | Delay after release before replying `OK` |
 | `UITEST_LVGL_LOCK_TIMEOUT_MS` | `1000` | Maximum LVGL mutex wait |
 | `UITEST_SHOT_TIMEOUT_MS` | `60000` | Maximum wait for the screenshot worker before `ERR SHOT ESP_ERR_TIMEOUT` |
-| `UITEST_MAX_REGISTERED` | `32` | Size of the id → object table |
+| `UITEST_MAX_REGISTERED` | `64` | Size of the id → object table |
 | `UITEST_MAX_ID_LENGTH` | `64` | Copied widget ID size including terminator |
 | `UITEST_MAX_DUMP_NODES` | `256` | Maximum nodes captured by DUMP |
 | `UITEST_MAX_DUMP_DEPTH` | `32` | Maximum serialized tree depth |
